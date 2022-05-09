@@ -1,0 +1,702 @@
+C51 COMPILER V9.60.0.0   MAIN                                                              04/02/2020 12:14:45 PAGE 1   
+
+
+C51 COMPILER V9.60.0.0, COMPILATION OF MODULE MAIN
+OBJECT MODULE PLACED IN .\Objects\main.obj
+COMPILER INVOKED BY: C:\Keil_v5\C51\BIN\C51.EXE main.c LARGE OPTIMIZE(8,SPEED) BROWSE DEBUG OBJECTEXTEND PRINT(.\Listing
+                    -s\main.lst) TABS(2) OBJECT(.\Objects\main.obj)
+
+line level    source
+
+   1          /**********************************************************************************
+   2          
+   3          * 开机的状态
+   4          * 1. 选择总液体容量(ml) 这时数码管四位数显示总液体容量 
+   5          *    按键功能 key1 +50(ml) : key2 -50(ml) : key3 下一步
+   6          * 2. 选择滴系数 滴系数有10、15、20(滴/ml)3种型号 数码管四位数显示10/15/20 
+   7          *    按键功能 key1 +5 : key2 -5 : key3 下一步
+   8          * 3. 正常输液状态 前两段数码管显示液体流速 后两段数码管显示已完成百分比进度
+   9          *    按键功能 设定的液体流速 key1 +5 : key2 -5 : key3 下一步 这时重新回到第一个状态
+  10          *ALARM. 累计大于十次检测到流速小于最小流速,认为液体滴完了进入报警状态 亮灯鸣笛
+  11          
+  12          ***********************************************************************************/
+  13          
+  14          #include <reg52.h>
+  15          #include <intrins.h>
+  16          #include  <tm1638.h>
+  17          
+  18          /* 定义常用变量 */
+  19          typedef unsigned char u8;
+  20          typedef unsigned int u16;
+  21          typedef unsigned long u32;
+  22          #define constrain(amt, low, high) ((amt) < (low) ? (amt = low) : ((amt) > (high) ? (amt = high) : (amt = a
+             -mt)))
+  23          #define limit(amt, low, high) ((amt) < (low) ? (amt = high) : ((amt) > (high) ? (amt = low) : (amt = amt))
+             -)
+  24          #define timer0Reload 1000
+  25          #define timer1Reload 100
+  26          #define WORK_STATE_NORMAL 0
+  27          #define WORK_STATE_ALARM 1
+  28          #define PID_OUTPUT_TO_SERVO_ANGLE 1 //PID输出 转换为 舵机角度
+  29          
+  30          /*********************引脚定义********************/
+  31          sbit pin_pwm = P2 ^ 7;
+  32          sbit pin_buzzer = P0 ^ 0;
+  33          sbit pin_inf = P3 ^ 1;
+  34          /* 定义全局变量 */
+  35          u8 numDisplay0 = 0;//数码管显示数字
+  36          u8 numDisplay1 = 0;//数码管显示数字
+  37          u8 numDisplay2 = 0;//数码管显示数字
+  38          u8 numDisplay3 = 0;//数码管显示数字
+  39          u8 numDisplay4 = 0;//数码管显示数字
+  40          u8 numDisplay5 = 0;//数码管显示数字
+  41          u8 numDisplay6 = 0;//数码管显示数字
+  42          u8 numDisplay7 = 0;//数码管显示数字
+  43          
+  44          u8 servoAngle = 90;   //舵机初始默认角度
+  45          u8 pwmHighTime = 5; //5 - 15 对应0-180度
+  46          u8 pwmPeriodCount = 200;//PWM周期 舵机的pwm周期为20ms
+  47          
+  48          u8 myCase = 1; //状态机选择,选择当前的状态
+  49          u32 exInt0Count = 0 ,tempExInt0Count = 0;//总液滴滴数
+  50          u32 timeMs = 0, tempTimeMs = 0; // 由定时器的到的系统时间 单位 ms
+  51          u16 diffTimeFiltered = 0;//滤波后的两次液滴滴下间隔时间
+  52          u16 liquidVolume = 100;   //总液体容积 ml
+C51 COMPILER V9.60.0.0   MAIN                                                              04/02/2020 12:14:45 PAGE 2   
+
+  53          u16 dropCoefficient = 15; //滴系数 临床常用的输液器 滴系数有10、15、20(滴/ml)3种型号
+  54          u8 liquidProgress = 0; //表示液位 也表示输液进度
+  55          u16 flowRateSet = 0,tempFlowRateSet = 0;  //点滴的流速设定值
+  56          u16 flowRateActual = 0; //点滴的流速真实值，由传感器计算得到
+  57          u16 miniFlowRate = 10;  //最小点滴流速 小于这个值就认为点滴当前流速为0，进而报警
+  58          u16 consumeLiquid; //已消耗的液体 容量
+  59          u8 residualLiquid_precent; //剩余液体 百分比 表示当前进度
+  60          u16 residualLiquid = 0;      //剩余液体 容量
+  61          u8 index=0,key=0;
+  62          u8 state = 0;
+  63          u16 counterTemp = 0;
+  64          u16 TempTime = 0;
+  65          u8 TrigFlag = 0;
+  66          u32 time = 0;
+  67          u32 perviousTime = 0;
+  68          u32 diffTime = 0;
+  69          u32 timeFilterTempValue = 0;
+  70          u16 exInt0CountActual;
+  71          float tempDropCoefficient = 0.0;
+  72          /*********************函数声明********************/
+  73          void delay(u16);
+  74          void Timer_Init();
+  75          void ExInt_Init();
+  76          float pid_control(long ref, long set, float Kp, float Ki, float Kd);
+  77          void servo_ctrl(flowRateActual, flowRateSet);
+  78          
+  79          /*********************主函数********************/
+  80          void main()
+  81          {
+  82   1        Timer_Init(); //定时器初始化
+  83   1        ExInt_Init(); //外部中断初始化
+  84   1        EA = 1;
+  85   1        ET0 = 0;
+  86   1        ET1 = 1;
+  87   1        
+  88   1        init_TM1638();      //初始化TM1638
+  89   1        
+  90   1        for(index=0;index<8;index++)
+  91   1          Write_DATA(index<<1,tab[0]);      //初始化寄存器
+  92   1        
+  93   1        Write_allLED(0x00);
+  94   1        
+  95   1        while (1)
+  96   1        {
+  97   2          
+  98   2          //写入数码管数据
+  99   2          Write_DATA(0,tab[numDisplay0]);
+ 100   2          Write_DATA(2,tab[numDisplay1]);   
+ 101   2          Write_DATA(4,tab[numDisplay2]);   
+ 102   2          Write_DATA(6,tab[numDisplay3]);
+ 103   2          Write_DATA(8,tab[numDisplay4]);   
+ 104   2          Write_DATA(10,tab[numDisplay5]);    
+ 105   2          Write_DATA(12,tab[numDisplay6]);
+ 106   2          Write_DATA(14,tab[numDisplay7]);    
+ 107   2          
+ 108   2          //选择总液体容积 ml
+ 109   2          if(myCase==1)
+ 110   2          {
+ 111   3            key = 1;
+ 112   3            if (Read_key() == key)
+ 113   3            {
+ 114   4              while ((Read_key()==key));
+C51 COMPILER V9.60.0.0   MAIN                                                              04/02/2020 12:14:45 PAGE 3   
+
+ 115   4              liquidVolume += 100;
+ 116   4              limit(liquidVolume, 0, 2000);
+ 117   4            }
+ 118   3            key = 0;
+ 119   3            if (Read_key() == key)
+ 120   3            {
+ 121   4              while ((Read_key()==key));
+ 122   4              liquidVolume -= 100;
+ 123   4              limit(liquidVolume, 0, 2000);
+ 124   4            }
+ 125   3            key = 3;
+ 126   3            if (Read_key() == key)
+ 127   3            {
+ 128   4              while ((Read_key()==key));
+ 129   4              liquidVolume += 50;
+ 130   4              limit(liquidVolume, 0, 2000);
+ 131   4            }
+ 132   3            key = 2;
+ 133   3            if (Read_key() == key)
+ 134   3            {
+ 135   4              while ((Read_key()==key));
+ 136   4              liquidVolume -= 50;
+ 137   4              limit(liquidVolume, 0, 2000);
+ 138   4            }
+ 139   3            key = 5;
+ 140   3            if (Read_key() == key)
+ 141   3            {
+ 142   4              while ((Read_key()==key));
+ 143   4              liquidVolume += 10;
+ 144   4              limit(liquidVolume, 0, 2000);
+ 145   4            }
+ 146   3            key = 4;
+ 147   3            if (Read_key() == key)
+ 148   3            {
+ 149   4              while ((Read_key()==key));
+ 150   4              liquidVolume -= 10;
+ 151   4              limit(liquidVolume, 0, 2000);
+ 152   4            }
+ 153   3            numDisplay0 = (liquidVolume / 1000) % 10;
+ 154   3            numDisplay1 = (liquidVolume / 100) % 10;
+ 155   3            numDisplay2 = (liquidVolume / 10) % 10;
+ 156   3            numDisplay3 = (liquidVolume / 1) % 10;
+ 157   3            numDisplay4 = 0;
+ 158   3            numDisplay5 = 0;
+ 159   3            numDisplay6 = 0;
+ 160   3            numDisplay7 = 1;
+ 161   3          }
+ 162   2          
+ 163   2          //选择滴系数 临床常用的输液器 滴系数有10、15、20(滴/ml)3种型号
+ 164   2          if(myCase==2)
+ 165   2          {
+ 166   3            key = 1;
+ 167   3            if (Read_key() == key)
+ 168   3            {
+ 169   4              while ((Read_key()==key));
+ 170   4              dropCoefficient += 5;
+ 171   4              limit(dropCoefficient, 10, 20);
+ 172   4            }
+ 173   3            key = 0;
+ 174   3            if (Read_key() == key)
+ 175   3            {
+ 176   4              while ((Read_key()==key));
+C51 COMPILER V9.60.0.0   MAIN                                                              04/02/2020 12:14:45 PAGE 4   
+
+ 177   4              dropCoefficient -= 5;
+ 178   4              limit(dropCoefficient, 10, 20);
+ 179   4            }
+ 180   3            numDisplay0 = (dropCoefficient / 1000) % 10;
+ 181   3            numDisplay1 = (dropCoefficient / 100) % 10;
+ 182   3            numDisplay2 = (dropCoefficient / 10) % 10;
+ 183   3            numDisplay3 = (dropCoefficient / 1) % 10;
+ 184   3            numDisplay4 = 0;
+ 185   3            numDisplay5 = 0;
+ 186   3            numDisplay6 = 0;
+ 187   3            numDisplay7 = 2;
+ 188   3          }
+ 189   2          
+ 190   2          //选择点滴的流速设定值
+ 191   2          if(myCase==3)
+ 192   2          {
+ 193   3            key = 1;
+ 194   3            if (Read_key() == key)
+ 195   3            {
+ 196   4              while ((Read_key()==key));
+ 197   4              flowRateSet += 5;
+ 198   4              limit(flowRateSet, 0, 100);
+ 199   4            }
+ 200   3            key = 0;
+ 201   3            if (Read_key() == key)
+ 202   3            {
+ 203   4              while ((Read_key()==key));
+ 204   4              flowRateSet -= 5;
+ 205   4              limit(flowRateSet, 0, 100);
+ 206   4            }
+ 207   3            numDisplay0 = (flowRateSet / 1000) % 10;
+ 208   3            numDisplay1 = (flowRateSet / 100) % 10;
+ 209   3            numDisplay2 = (flowRateSet / 10) % 10;
+ 210   3            numDisplay3 = (flowRateSet / 1) % 10;
+ 211   3            numDisplay4 = 0;
+ 212   3            numDisplay5 = 0;
+ 213   3            numDisplay6 = 0;
+ 214   3            numDisplay7 = 3;
+ 215   3            exInt0CountActual =0;
+ 216   3            liquidProgress=0;
+ 217   3            flowRateActual=0;
+ 218   3            diffTime=0;
+ 219   3            tempFlowRateSet=flowRateSet;
+ 220   3          }
+ 221   2          
+ 222   2          //开启定时器进行流速控制
+ 223   2          if(myCase==4)
+ 224   2          {
+ 225   3            
+ 226   3            
+ 227   3            key = 1;
+ 228   3            if (Read_key() == key)
+ 229   3            {
+ 230   4              while ((Read_key()==key));
+ 231   4              flowRateSet += 5;
+ 232   4              limit(flowRateSet, 0, 100);
+ 233   4            }
+ 234   3            key = 0;
+ 235   3            if (Read_key() == key)
+ 236   3            {
+ 237   4              while ((Read_key()==key));
+ 238   4              flowRateSet -= 5;
+C51 COMPILER V9.60.0.0   MAIN                                                              04/02/2020 12:14:45 PAGE 5   
+
+ 239   4              limit(flowRateSet, 0, 100);
+ 240   4            }
+ 241   3            
+ 242   3            numDisplay0 = ((flowRateActual) / 10) % 10;
+ 243   3            numDisplay1 = ((flowRateActual) / 1) % 10;
+ 244   3            numDisplay2 = (liquidProgress / 10) % 10;
+ 245   3            numDisplay3 = (liquidProgress / 1) % 10;
+ 246   3            numDisplay4 = (timeMs / 1000) % 10;
+ 247   3            numDisplay5 = (timeMs / 100) % 10;
+ 248   3            numDisplay6 = (timeMs / 10) % 10;
+ 249   3            numDisplay7 = (timeMs / 1) % 10;
+ 250   3            
+ 251   3            timeMs++;//分秒
+ 252   3            
+ 253   3            //液滴速度 每小时输入的毫升数(ml/h) = (滴/min) x 60(min/h) / 滴系数(滴/ml)
+ 254   3            flowRateActual = (1 * 60 / diffTime) * 60 / dropCoefficient;
+ 255   3            
+ 256   3            if (liquidProgress >= 100) 
+ 257   3            {
+ 258   4              state = WORK_STATE_ALARM;
+ 259   4            }
+ 260   3            else
+ 261   3            {
+ 262   4              if (flowRateActual <= 5) 
+ 263   4                state = WORK_STATE_ALARM;
+ 264   4              else
+ 265   4                state = WORK_STATE_NORMAL;
+ 266   4            }
+ 267   3            
+ 268   3      
+ 269   3      
+ 270   3            
+ 271   3          }
+ 272   2          
+ 273   2          //下一步 上一步 切换
+ 274   2          key = 7;
+ 275   2          if (Read_key() == key)
+ 276   2          {
+ 277   3            while ((Read_key()==key));
+ 278   3            myCase++;
+ 279   3            limit(myCase, 1, 4);
+ 280   3          }
+ 281   2          key = 6;
+ 282   2          if (Read_key() == key)
+ 283   2          {
+ 284   3            while ((Read_key()==key));
+ 285   3            myCase--;
+ 286   3            limit(myCase, 1, 4);
+ 287   3          }
+ 288   2          
+ 289   2          switch (state)
+ 290   2          {
+ 291   3          case WORK_STATE_NORMAL: // 正常状态
+ 292   3      //      //液滴速度 每小时输入的毫升数(ml/h) = (滴/min) x 60(min/h) / 滴系数(滴/ml)
+ 293   3      //      flowRateActual = (1000 * 60 / diffTimeFiltered) * 60 / dropCoefficient;
+ 294   3            //剩余液体容积(ml)= 液体总容积(ml) - 已消耗的液体容积(ml)
+ 295   3            residualLiquid = liquidVolume - consumeLiquid;
+ 296   3            //输液进度(液位)= 已消耗的液体容积(ml) / 液体总容积(ml)
+ 297   3            liquidProgress = 100 * consumeLiquid / liquidVolume;
+ 298   3            //舵机控制角度PID计算 输入:液滴的真实速度 液滴的设定速度 KP KI KD  输出:舵机角度
+ 299   3            //servoAngle = pid_control(flowRateActual, flowRateSet, 0.5f, 0.00f, 0.0001f) * PID_OUTPUT_TO_SERVO_ANG
+             -LE;
+C51 COMPILER V9.60.0.0   MAIN                                                              04/02/2020 12:14:45 PAGE 6   
+
+ 300   3            //由舵机控制角度，控制对输液管的压力，达到该表流速的效果
+ 301   3            servo_ctrl(flowRateActual, flowRateSet);
+ 302   3            flowRateSet=tempFlowRateSet;
+ 303   3            pin_buzzer = 1;    //蜂鸣器响起
+ 304   3            Write_allLED(0x00);
+ 305   3            break;
+ 306   3          case WORK_STATE_ALARM: // 报警状态
+ 307   3            pin_buzzer = 0;    //蜂鸣器响起
+ 308   3            Write_allLED(0xff);
+ 309   3            flowRateSet=0;
+ 310   3            servo_ctrl(flowRateActual, flowRateSet);
+ 311   3            break;
+ 312   3          default:
+ 313   3            break;
+ 314   3          }
+ 315   2          
+ 316   2      
+ 317   2          
+ 318   2          
+ 319   2      
+ 320   2          
+ 321   2          //tempTimeDs++;
+ 322   2          //timeMs = tempTimeMs*10;
+ 323   2          
+ 324   2      //    
+ 325   2      
+ 326   2      //    //判断流速是否小于最小流速，如果是则记录一次
+ 327   2      //    flowRateActual < miniFlowRate ? counterTemp++ : counterTemp--;
+ 328   2      //    constrain(counterTemp, 0, 10);
+ 329   2      //    //只有累计大于十次检测到流速小于最小流速才认为液体滴完了，进入报警状态整个过程持续1s
+ 330   2      //    if (counterTemp >= 10)
+ 331   2      //    {
+ 332   2      //      counterTemp = 0;
+ 333   2      //      state = WORK_STATE_ALARM;
+ 334   2      //    }
+ 335   2          
+ 336   2        }
+ 337   1      }
+ 338          
+ 339          //#define PWM_GENERATE_FREQUENCY 100 //频率
+ 340          #define STATE_PROCESS_FREQUENCY 10   //频率
+ 341          #define DETECT_FREQUENCY 1     //频率
+ 342          
+ 343          u32 t = 0;
+ 344          static u32 tTime[2];
+ 345          u16 Counter0;
+ 346          void Timer0() interrupt 1 //定时器0中断
+ 347          {
+ 348   1        TH0 = (65536 - timer0Reload) / 256;
+ 349   1        TL0 = (65536 - timer0Reload) % 256;
+ 350   1        timeMs++;
+ 351   1      }
+ 352          
+ 353          void Timer1() interrupt 3 //定时器1中断
+ 354          {
+ 355   1        TH1 = (65536 - timer1Reload) / 256;
+ 356   1        TL1 = (65536 - timer1Reload) % 256;
+ 357   1        pwmPeriodCount++; // pwmPeriodCount 从0到200循环
+ 358   1        if(pwmPeriodCount>=200) pwmPeriodCount=0;
+ 359   1        (pwmPeriodCount > pwmHighTime) ? (pin_pwm = 0) : (pin_pwm = 1);
+ 360   1      }
+ 361          
+C51 COMPILER V9.60.0.0   MAIN                                                              04/02/2020 12:14:45 PAGE 7   
+
+ 362          u16 CounterExint0;
+ 363          /*******************外部中断**********************/
+ 364          void EX_INT0() interrupt 0 //外部中断0
+ 365          {
+ 366   1        //液滴计数，光电传感器触发一次，下降沿触发一次，计为一个液滴
+ 367   1        tempExInt0Count++;
+ 368   1        if(tempExInt0Count>=3)
+ 369   1        {
+ 370   2          perviousTime = time;
+ 371   2          time = timeMs;
+ 372   2          diffTime = time - perviousTime; //计算得到两个液滴之间的时间间隔 ms
+ 373   2          tempExInt0Count=0;
+ 374   2          exInt0CountActual++;
+ 375   2          //已经消耗的毫升数(ml)＝(滴) / 滴系数(滴/ml)。
+ 376   2          consumeLiquid = exInt0CountActual / dropCoefficient;
+ 377   2        }
+ 378   1      }
+ 379          
+ 380          
+ 381          // PID控制器
+ 382          float pid_control(long ref, long set, float Kp, float Ki, float Kd)
+ 383          {
+ 384   1        float max_out = 100.0f, max_iout = 100.0f;
+ 385   1        float out, Pout, Iout, Dout;
+ 386   1        float error[3], Dbuf[3];
+ 387   1      
+ 388   1        error[2] = error[1];
+ 389   1        error[1] = error[0];
+ 390   1        error[0] = set - ref;
+ 391   1      
+ 392   1        Pout = Kp * error[0];
+ 393   1        Iout += Ki * error[0];
+ 394   1        Dbuf[2] = Dbuf[1];
+ 395   1        Dbuf[1] = Dbuf[0];
+ 396   1        Dbuf[0] = (error[0] - error[1]);
+ 397   1        Dout = Kd * Dbuf[0];
+ 398   1        constrain(Iout, 1.0f, max_iout);
+ 399   1        out = Pout + Iout + Dout;
+ 400   1        constrain(out, 0, max_out);
+ 401   1        return (out);
+ 402   1      }
+ 403          
+ 404          int temp=0;
+ 405          // 舵机角度控制, pwmHighTime 5-25 angle 0-180
+ 406          void servo_ctrl(flowRateActual, flowRateSet)
+ 407          {
+ 408   1        pwmHighTime = 5+flowRateSet/10;
+ 409   1        
+ 410   1      //  temp = flowRateActual-flowRateSet;
+ 411   1      //  if( (temp < -3000) ) pwmHighTime=5;
+ 412   1      //  else if( (temp >  -3000)&&(temp < -1000) ) pwmHighTime=6;
+ 413   1      //  else if( (temp >  -1000)&&(temp < -500) ) pwmHighTime=8;
+ 414   1      //  else if( (temp >  -500)&&(temp < -0) ) pwmHighTime=9;
+ 415   1      //  else if( (temp >  0)&&(temp < 500) ) pwmHighTime=10;
+ 416   1      //  else if( (temp >  500)&&(temp < 1000) ) pwmHighTime=12;
+ 417   1      //  else if( (temp >  1000)&&(temp < 3000) ) pwmHighTime=14;
+ 418   1      //  else if( (temp >  3000) ) pwmHighTime=15;
+ 419   1      //  
+ 420   1      //  pwmHighTime = angle / 9 + 5;
+ 421   1      //  limit(pwmHighTime,5,25);
+ 422   1      }
+ 423          
+C51 COMPILER V9.60.0.0   MAIN                                                              04/02/2020 12:14:45 PAGE 8   
+
+ 424          
+ 425          void ExInt_Init()
+ 426          {
+ 427   1        IT0 = 1; //设置中断类型 1为下降沿 0为低电平
+ 428   1        EX0 = 1; //使能外部中断0
+ 429   1        EA = 1;
+ 430   1        //  IT1 = 1; //设置中断类型 1为下降沿 0为低电平
+ 431   1        //  EX1 = 1; //使能外部中断1
+ 432   1      }
+ 433          
+ 434          void Timer_Init()
+ 435          {
+ 436   1        EA = 1;           // 设置中断允许寄存器：1.打开中断总开关
+ 437   1        ET0 = 1;          // 设置中断允许寄存器：2.打开定时器0
+ 438   1        ET1 = 1;          // 设置中断允许寄存器：2.打开定时器1
+ 439   1        TMOD = 0x11;        // 设置工作方式寄存器TMOD：工作方式1 -> 0x01
+ 440   1        TH0 = (65536 - timer0Reload) / 256; // 设置定时器0定时时间100ns
+ 441   1        TL0 = (65536 - timer0Reload) % 256; //
+ 442   1        TH1 = (65536 - timer1Reload) / 256; // 设置定时器1定时时间1ms
+ 443   1        TH1 = (65536 - timer1Reload) % 256; //
+ 444   1        TR0 = 1;          // 设置控制寄存器：启动定时器0
+ 445   1        TR1 = 1;          // 设置控制寄存器：启动定时器1
+ 446   1      }
+ 447          
+ 448          /******************************************************
+ 449           Function    : 延时子程序
+ 450           Description : 延时 x 毫秒
+ 451          *******************************************************/
+ 452          void delay(u16 xms)
+ 453          {
+ 454   1        int x, y;
+ 455   1        for (x = xms; x > 0; x--)
+ 456   1        {
+ 457   2          for (y = 125; y > 0; y--)
+ 458   2            ;
+ 459   2        }
+ 460   1      }
+ 461          //sbit pin_ex_int0 = P3 ^ 2; //外部中断0
+ 462          //sbit pin_ex_int1 = P3 ^ 3; //外部中断1
+ 463          
+ 464          //u32 millis()
+ 465          //{
+ 466          //  return timeMs;
+ 467          //}
+ 468          
+ 469          //P1口接数码管的7位段选
+ 470          //sbit wela1 = P2 ^ 0; // 位选
+ 471          //sbit wela2 = P2 ^ 1; // 位选
+ 472          //sbit wela3 = P2 ^ 2; // 位选
+ 473          //sbit wela4 = P2 ^ 3; // 位选
+ 474          //sbit pin_led = P3 ^ 0;
+ 475          
+ 476          //u8 code table[] = {0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07,//共阴数码管段选码表
+ 477          //           0x7f, 0x6f, 0x77, 0x7c, 0x39, 0x5e, 0x79, 0x71};
+ 478          ////u8 code table[] = {0xc0, 0xf9, 0xa4, 0xb0, 0x99, 0x92, 0x82, 0xf8, //共阳数码管段选码表
+ 479          ////           0x80, 0x90, 0x88, 0x83, 0xc6, 0xa1, 0x86, 0x8e};
+ 480          
+ 481          //u8 shi_1 = 0, ge_1 = 0;//数码管显示前两位
+ 482          //u8 shi_2 = 0, ge_2 = 0;//数码管显示后两位
+ 483          
+ 484          //u8 num[8];    //各个数码管显示的值
+ 485          
+C51 COMPILER V9.60.0.0   MAIN                                                              04/02/2020 12:14:45 PAGE 9   
+
+ 486            
+ 487            
+ 488          //  timeMs++;
+ 489          //  Counter1++;
+ 490          //  if (Counter1 >= timerPeriod1)
+ 491          //  {
+ 492          //    Counter1 = 0;
+ 493          //    
+ 494          //      
+ 495          //    if ((t - tTime[0]) >= (1000 / PWM_GENERATE_FREQUENCY))
+ 496          //    {
+ 497          //      pwmPeriodCount++;
+ 498          //      limit(pwmPeriodCount, 0, 200);
+ 499          //      (pwmPeriodCount > pwmHighTime) ? (pin_pwm = 0) : (pin_pwm = 1);
+ 500          //      tTime[0] = t;
+ 501          //      
+ 502          //    
+ 503          //    
+ 504          //    }
+ 505          //  }
+ 506          
+ 507          
+ 508            
+ 509          //  if(TrigFlag == 1)
+ 510          //  {
+ 511          //    TempTime++;
+ 512          //    if(TempTime >= 10)
+ 513          //    {
+ 514          //      TempTime=0;
+ 515          //      TrigFlag=0;
+ 516          //    }
+ 517          //    
+ 518          //  }
+ 519            
+ 520          //  perviousTime = time;
+ 521          //  time = timeMs;
+ 522          //  diffTime = time - perviousTime; //计算得到两个液滴之间的时间间隔 ms
+ 523            
+ 524          //  diffTimeFiltered = diffTime;
+ 525          //  if(diffTimeFiltered>10)
+ 526          //  {
+ 527          //  //液滴计数，光电传感器触发一次，下降沿触发一次，计为一个液滴
+ 528          //  exInt0Count++; 
+ 529          //  //已经消耗的毫升数(ml)＝(滴) / 滴系数(滴/ml)。
+ 530          //  consumeLiquid = exInt0Count / dropCoefficient;
+ 531          //  //液滴速度 每小时输入的毫升数(ml/h) = (滴/min) x 60(min/h) / 滴系数(滴/ml)
+ 532          //  flowRateActual = (1000 * 60 / diffTimeFiltered) * 60 / dropCoefficient;
+ 533          //  }
+ 534          //  
+ 535            
+ 536          //  if ((t - tTime[0]) >= (1000 / PWM_GENERATE_FREQUENCY))
+ 537          //  {
+ 538          //    pwmPeriodCount++;
+ 539          //    limit(pwmPeriodCount, 0, 200);
+ 540          //    (pwmPeriodCount > pwmHighTime) ? (pin_pwm = 0) : (pin_pwm = 1);
+ 541          //    tTime[0] = t;
+ 542          //  }
+ 543          //  if ((t - tTime[1]) >= (1000 / STATE_PROCESS_FREQUENCY))
+ 544          //  {
+ 545          //    switch (state)
+ 546          //    {
+ 547          //    case WORK_STATE_NORMAL:       // 正常状态
+C51 COMPILER V9.60.0.0   MAIN                                                              04/02/2020 12:14:45 PAGE 10  
+
+ 548          ////      numDisplay1 = flowRateActual; //前两段数码管显示液体流速
+ 549          ////      numDisplay2 = liquidProgress; //后两段数码管显示已完成百分比进度
+ 550          
+ 551          //      //液滴速度 每小时输入的毫升数(ml/h) = (滴/min) x 60(min/h) / 滴系数(滴/ml)
+ 552          //      flowRateActual = (1000 * 60 / diffTimeFiltered) * 60 / dropCoefficient;
+ 553          //      //剩余液体容积(ml)= 液体总容积(ml) - 已消耗的液体容积(ml)
+ 554          //      residualLiquid = liquidVolume - consumeLiquid;
+ 555          //      //输液进度(液位)= 已消耗的液体容积(ml) / 液体总容积(ml)
+ 556          //      liquidProgress = consumeLiquid / liquidVolume;
+ 557          //      //舵机控制角度PID计算 输入:液滴的真实速度 液滴的设定速度 KP KI KD  输出:舵机角度
+ 558          //      servoAngle = pid_control(flowRateActual, flowRateSet, 10.0f, 0.01f, 0.001f) * PID_OUTPUT_TO_SERVO_ANG
+             -LE;
+ 559          //      //由舵机控制角度，控制对输液管的压力，达到该表流速的效果
+ 560          //      servo_ctrl(servoAngle);
+ 561          
+ 562          //      break;
+ 563          //    case WORK_STATE_ALARM: // 报警状态
+ 564          //      pin_buzzer = 0;    //蜂鸣器响起
+ 565          //      Write_allLED(0xff);
+ 566          //      //pin_led = 0;     //LED灯亮
+ 567          //      break;
+ 568          //    default:
+ 569          //      break;
+ 570          //    }
+ 571          //    tTime[1] = t;
+ 572          //  }
+ 573          //  if ((t - tTime[2]) >= (1000 / DETECT_FREQUENCY))
+ 574          //  {
+ 575          //    //判断流速是否小于最小流速，如果是则记录一次
+ 576          //    flowRateActual < miniFlowRate ? counterTemp++ : counterTemp--;
+ 577          //    constrain(counterTemp, 0, 10);
+ 578          //    //只有累计大于十次检测到流速小于最小流速才认为液体滴完了，进入报警状态整个过程持续1s
+ 579          //    if (counterTemp >= 10)
+ 580          //    {
+ 581          //      counterTemp = 0;
+ 582          //      state = WORK_STATE_ALARM;
+ 583          //    }
+ 584          //    tTime[2] = t;
+ 585          //  }
+ 586          
+ 587          //// 舵机角度控制, pwmHighTime 5-25 angle 0-180
+ 588          //void servo_ctrl(u16 angle)
+ 589          //{
+ 590          //  pwmHighTime = angle / 9 + 5;
+ 591          //  limit(pwmHighTime,5,25);
+ 592          //}
+ 593          
+ 594          //  timeFilterTempValue += diffTime;
+ 595          //  CounterExint0++;
+ 596          //  limit(CounterExint0, 0, 9);
+ 597          //  if (CounterExint0 == 9)
+ 598          //  {
+ 599          //    diffTimeFiltered = timeFilterTempValue / 10; //均值滤波，取十个数据算平均值
+ 600          //    timeFilterTempValue = 0;
+ 601          //  }
+ 602            
+ 603          //  TrigFlag=1;
+ 604          //  
+ 605          //  if(TrigFlag == 0)
+ 606          //  {
+ 607          
+ 608          //  TempTime++;
+C51 COMPILER V9.60.0.0   MAIN                                                              04/02/2020 12:14:45 PAGE 11  
+
+ 609          //  if(TempTime >= 100)
+ 610          //  {
+ 611          //    TempTime=0;
+ 612          //    timeMs++;
+ 613          //  }
+ 614            
+ 615          //  if (pin_irf == 0)
+ 616          //  {
+ 617          //    while (pin_irf == 0);
+ 618          //    
+ 619          //    
+ 620          //    dropCoefficient += 5;
+ 621          //    limit(dropCoefficient, 10, 20);
+ 622          //  }
+ 623            
+ 624          //  if (pin_inf == 0)
+ 625          //  {
+ 626          //    delay(10); // 按键消抖
+ 627          //    if (pin_inf == 0)
+ 628          //    {
+ 629          //      perviousTime = time;
+ 630          //      time = timeMs;
+ 631          //      diffTime = time - perviousTime; //计算得到两个液滴之间的时间间隔 ms
+ 632          //      diffTimeFiltered = diffTime;
+ 633          //      //液滴计数，光电传感器触发一次，下降沿触发一次，计为一个液滴
+ 634          //      exInt0Count++; 
+ 635          //      //已经消耗的毫升数(ml)＝(滴) / 滴系数(滴/ml)。
+ 636          //      consumeLiquid = exInt0Count / dropCoefficient;
+ 637          //      //液滴速度 每小时输入的毫升数(ml/h) = (滴/min) x 60(min/h) / 滴系数(滴/ml)
+ 638          //      flowRateActual = (1000 * 60 / diffTimeFiltered) * 60 / dropCoefficient;
+ 639          //    }
+ 640          //    while (!pin_inf);   // 检测是否松开按键
+ 641          //    delay(10); // 消抖
+ 642          //    while (!pin_inf)
+ 643          //      ;
+ 644          //  }
+ 645              
+ 646            //tempDropCoefficient = (float)dropCoefficient;
+ 647          
+ 648          //void EX_INT1() interrupt 2 //外部中断1
+ 649          //{
+ 650          //}
+ 651          
+ 652          //  sbit key1 = P2 ^ 4;
+ 653          //sbit key2 = P2 ^ 5;
+ 654          //sbit key3 = P2 ^ 6;
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =   3625    ----
+   CONSTANT SIZE    =     16    ----
+   XDATA SIZE       =     96      74
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =   ----    ----
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =   ----    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)

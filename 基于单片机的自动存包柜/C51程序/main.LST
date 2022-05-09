@@ -1,0 +1,561 @@
+C51 COMPILER V9.60.0.0   MAIN                                                              03/31/2020 22:05:26 PAGE 1   
+
+
+C51 COMPILER V9.60.0.0, COMPILATION OF MODULE MAIN
+OBJECT MODULE PLACED IN main.OBJ
+COMPILER INVOKED BY: C:\Keil_v5\C51\BIN\C51.EXE main.c LARGE OPTIMIZE(8,SPEED) BROWSE DEBUG OBJECTEXTEND TABS(2)
+
+line level    source
+
+   1          
+   2          /*************  功能说明  **************
+   3          因为内存空间和定时器资源的问题 普通的STC89C52RC已经不满足需要
+   4          该设计选用 STC15F2K60S2 该芯片和STC89C51引脚外观都完全一致 不同的是内部资源 可以完全替换c51
+   5          
+   6          使用了3个定时器:
+   7          定时器0中断用来循环刷新LED点阵的状态 用作显示功能
+   8          定时器1中断用来循环检测矩阵键盘的状态，用来记录和判断哪一个按键按下去了
+   9          定时器2中断用作串口的波特率产生 由寄存器来配置
+  10          
+  11          串口1全双工中断方式收发通讯程序 使用22.1184MHZ时钟 如要改变 请修改下面的"定义主时钟"的值并重新编译
+  12          串口设置为：115200,8,n,1.
+  13          
+  14          在主循环中：
+  15          检测矩阵键盘数组中的状态 赋值给LED矩阵数组
+  16          检测串口接收的数组中的数字与预制的条码数组对比 得到当前扫描的条码对应的柜门序号 并关闭LED灯表示柜门打开
+  17          ******************************************/
+  18          #include "STC15Fxxxx.H"
+*** WARNING C322 IN LINE 539 OF STC15Fxxxx.H: unknown identifier
+*** WARNING C322 IN LINE 541 OF STC15Fxxxx.H: unknown identifier
+*** WARNING C322 IN LINE 543 OF STC15Fxxxx.H: unknown identifier
+*** WARNING C322 IN LINE 545 OF STC15Fxxxx.H: unknown identifier
+*** WARNING C322 IN LINE 547 OF STC15Fxxxx.H: unknown identifier
+*** WARNING C322 IN LINE 549 OF STC15Fxxxx.H: unknown identifier
+*** WARNING C322 IN LINE 551 OF STC15Fxxxx.H: unknown identifier
+  19          #include <intrins.h>
+  20          #define uchar unsigned char
+  21          #define uint  unsigned int
+  22            
+  23          #define constrain(amt, low, high) ((amt) < (low) ? (amt = low) : ((amt) > (high) ? (amt = high) : (amt = a
+             -mt)))
+  24          #define limit(amt, low, high) ((amt) < (low) ? (amt = high) : ((amt) > (high) ? (amt = low) : (amt = amt))
+             -)
+  25          
+  26          /*************  本地常量声明  **************/
+  27          //#define MAIN_Fosc 22118400L //定义主时钟
+  28          
+  29          #define MAIN_Fosc 12000000L //定义主时钟
+  30          
+  31          #define RX1_Lenth 32     //串口接收缓冲长度
+  32          #define BaudRate1 9600UL //选择波特率
+  33          #define BaudRate2 9600UL //选择波特率
+  34          
+  35          #define Timer2_Reload (65536UL - (MAIN_Fosc / 4 / BaudRate2)) //Timer2 300KHZ
+  36          
+  37          /*************  本地变量声明  **************/
+  38          u8 idata RX1_Buffer[RX1_Lenth]; //接收缓冲
+  39          u8 TX1_Cnt;           //发送计数
+  40          u8 RX1_Cnt;           //接收计数
+  41          bit B_TX1_Busy;         //发送忙标志
+  42          
+  43          //条形码的值对应的序号矩阵
+  44          u32 BarCode_Table[24] = {90311017, 90311024, 90311031, 90311048,
+  45                       90311055, 90311062, 90311079, 90311086,
+  46                       90311093, 90311109, 90311116, 90311123,
+C51 COMPILER V9.60.0.0   MAIN                                                              03/31/2020 22:05:26 PAGE 2   
+
+  47                       90311130, 90311147, 90311154, 90311161,
+  48                       90311178, 90311185, 90311192, 90311208,
+  49                       90311215, 90311222, 90311239, 90311246};
+  50          
+  51          //
+  52          //定义Max7219端口
+  53          sbit Max7219_pinCLK = P2^2;
+  54          sbit Max7219_pinCS  = P2^1;
+  55          sbit Max7219_pinDIN = P2^0;
+  56                       
+  57          u8 LED_LIST_INDEX = 1; //LED矩阵的列索引
+  58          u8 LED_LINE_INDEX = 1; //LED矩阵的行索引
+  59          //LED矩阵数组，6行4列，亮为0，灭为1
+  60          //u8 Matrix_LED[6][4] = {{1, 1, 1, 1},
+  61          //                       {1, 1, 1, 1},
+  62          //                       {1, 1, 1, 1},
+  63          //                       {1, 1, 1, 1},
+  64          //                       {1, 1, 1, 1},
+  65          //                       {1, 1, 1, 1}};
+  66          
+  67          u8 Matrix_LED[6][4] = {{0, 0, 0, 0},
+  68                                 {0, 0, 0, 0},
+  69                                 {0, 0, 0, 0},
+  70                                 {0, 0, 0, 0},
+  71                                 {0, 0, 0, 0},
+  72                                 {0, 0, 0, 0}};
+  73          //KEY矩阵列接口定义
+  74          sbit PIN_KEY_LIST_1 = P1 ^ 4;
+  75          sbit PIN_KEY_LIST_2 = P1 ^ 5;
+  76          sbit PIN_KEY_LIST_3 = P1 ^ 6;
+  77          sbit PIN_KEY_LIST_4 = P1 ^ 7;
+  78          //KEY矩阵行接口定义
+  79          //sbit PIN_KEY_LINE_1 = P1 ^ 0;
+  80          //sbit PIN_KEY_LINE_2 = P1 ^ 1;
+  81          //sbit PIN_KEY_LINE_3 = P1 ^ 2;
+  82          //sbit PIN_KEY_LINE_4 = P1 ^ 3;
+  83          sbit PIN_KEY_LINE_1 = P0 ^ 0;
+  84          sbit PIN_KEY_LINE_2 = P0 ^ 1;
+  85          sbit PIN_KEY_LINE_3 = P0 ^ 2;
+  86          sbit PIN_KEY_LINE_4 = P0 ^ 3;
+  87                                 
+  88          sbit PIN_KEY_LINE_5 = P3 ^ 2;
+  89          sbit PIN_KEY_LINE_6 = P3 ^ 3;
+  90          
+  91          u8 KEY_LIST_INDEX = 1; //KEY矩阵的列索引
+  92          u8 KEY_LINE_INDEX = 1; //KEY矩阵的行索引
+  93          //按键矩阵数组，6行4列，按下为0，未按下为1
+  94          u8 Matrix_KEY[6][4] = {{1, 1, 1, 1},
+  95                                 {1, 1, 1, 1},
+  96                                 {1, 1, 1, 1},
+  97                                 {1, 1, 1, 1},
+  98                                 {1, 1, 1, 1},
+  99                                 {1, 1, 1, 1}};
+ 100          //u8 Matrix_KEY[6][4] = {{0, 0, 0, 0},
+ 101          //                       {0, 0, 0, 0},
+ 102          //                       {0, 0, 0, 0},
+ 103          //                       {0, 0, 0, 0},
+ 104          //                       {0, 0, 0, 0},
+ 105          //                       {0, 0, 0, 0}};
+ 106          /*************  私有变量声明  **************/
+ 107          u16 i, j, k;    //用来做索引的变量
+ 108          u32 Scan_BarCode; //扫描到的条码的值
+C51 COMPILER V9.60.0.0   MAIN                                                              03/31/2020 22:05:26 PAGE 3   
+
+ 109          /**********************************************/
+ 110          
+ 111          //--------------------------------------------
+ 112          //功能：向MAX7219(U3)写入字节
+ 113          //入口参数：DATA 
+ 114          //出口参数：无
+ 115          //说明：
+ 116          void Write_Max7219_byte(uchar DATA)         
+ 117          {
+ 118   1            uchar i;    
+ 119   1          Max7219_pinCS=0;    
+ 120   1            for(i=8;i>=1;i--)
+ 121   1                {     
+ 122   2                  Max7219_pinCLK=0;
+ 123   2                  Max7219_pinDIN=DATA&0x80;
+ 124   2                  DATA=DATA<<1;
+ 125   2                  Max7219_pinCLK=1;
+ 126   2                 }                                 
+ 127   1      }
+ 128          //-------------------------------------------
+ 129          //功能：向MAX7219写入数据
+ 130          //入口参数：address、dat
+ 131          //出口参数：无
+ 132          //说明：
+ 133          void Write_Max7219(uchar address,uchar dat)
+ 134          { 
+ 135   1         Max7219_pinCS=0;
+ 136   1         Write_Max7219_byte(address);           //写入地址，即数码管编号
+ 137   1         Write_Max7219_byte(dat);               //写入数据，即数码管显示数字 
+ 138   1         Max7219_pinCS=1;                        
+ 139   1      }
+ 140          
+ 141          void Init_MAX7219(void)
+ 142          {
+ 143   1       Write_Max7219(0x09, 0x00);       //译码方式：BCD码
+ 144   1       Write_Max7219(0x0a, 0x03);       //亮度 
+ 145   1       Write_Max7219(0x0b, 0x07);       //扫描界限；8个数码管显示
+ 146   1       Write_Max7219(0x0c, 0x01);       //掉电模式：0，普通模式：1
+ 147   1       Write_Max7219(0x0f, 0x00);       //显示测试：1；测试结束，正常显示：0
+ 148   1      }
+ 149          
+ 150          void Delay_xms(uint x)
+ 151          {
+ 152   1       uint i,j;
+ 153   1       for(i=0;i<x;i++)
+ 154   1        for(j=0;j<112;j++);
+ 155   1      }
+ 156          
+ 157          
+ 158          //uchar i,j;
+ 159          uchar led_line[6] = {0x00,0x00,0x00,0x00,0x00,0x00};
+ 160          
+ 161          void Delay(uint x)
+ 162          {
+ 163   1        uchar i;
+ 164   1        while(x--)
+ 165   1        {
+ 166   2          for(i=0;i<120;i++);
+ 167   2        }
+ 168   1      }
+ 169          
+ 170          void putc_to_SerialPort(uchar c)
+C51 COMPILER V9.60.0.0   MAIN                                                              03/31/2020 22:05:26 PAGE 4   
+
+ 171          {
+ 172   1        SBUF = c;
+ 173   1        while(TI == 0);
+ 174   1        TI = 0;
+ 175   1      }
+ 176          
+ 177          void puts_to_SerialPort(uchar *s)
+ 178          {
+ 179   1        while(*s != '\0')
+ 180   1        {
+ 181   2          putc_to_SerialPort(*s);
+ 182   2          s++;
+ 183   2          Delay(5); 
+ 184   2        }
+ 185   1      }
+ 186          
+ 187          uchar Receive_Buffer[101];
+ 188          uchar Buf_Index = 0;
+ 189            uchar c = 0;
+ 190          void main(void)
+ 191          {
+ 192   1        B_TX1_Busy = 0;
+ 193   1        RX1_Cnt = 0;
+ 194   1        TX1_Cnt = 0;
+ 195   1      
+ 196   1        /**********定时器0 定时器1 配置**********/
+ 197   1        EA = 1;           // 设置中断允许寄存器：1.打开中断总开关
+ 198   1        ET0 = 1;          // 设置中断允许寄存器：2.打开定时器0
+ 199   1        //ET1 = 1;          // 设置中断允许寄存器：2.打开定时器1
+ 200   1        TMOD = 0x11;        // 设置工作方式寄存器TMOD：工作方式1 -> 0x01
+ 201   1        TH0 = (65536 - 500) / 256; // 设置定时器0定时时间1ms
+ 202   1        TL0 = (65536 - 500) % 256; //
+ 203   1        //TH1 = (65536 - 500) / 256; // 设置定时器1定时时间1ms
+ 204   1        //TH1 = (65536 - 500) % 256; //
+ 205   1        TR0 = 1;          // 设置控制寄存器：启动定时器0
+ 206   1        //TR1 = 1;          // 设置控制寄存器：启动定时器1
+ 207   1        EA = 1;     //允许全局中断
+ 208   1        
+ 209   1      
+ 210   1      //  /**********串口1配置**********/
+ 211   1      //  S1_8bit();      //8位数据
+ 212   1      //  S1_USE_P30P31();  //UART1 使用P30 P31口 默认
+ 213   1      //  Timer2_Stop();    //禁止定时器2计数
+ 214   1      //  S1_BRT_UseTimer2(); //波特率使用Timer2产生
+ 215   1      //  Timer2_1T();    //Timer2 set as 1T mode
+ 216   1      //  TH2 = (u8)(Timer2_Reload >> 8);
+ 217   1      //  TL2 = (u8)Timer2_Reload;
+ 218   1      //  Timer2_Run(); //允许定时器2计数
+ 219   1      //  REN = 1;    //允许接收
+ 220   1      //  ES = 1;     //允许串行中断
+ 221   1      
+ 222   1        SCON = 0x50;
+ 223   1        TMOD = 0x20;
+ 224   1        PCON = 0x00;
+ 225   1        TH1  = 0xfd;
+ 226   1        TL1  = 0xfd;
+ 227   1        EA   = 1;
+ 228   1        EX0  = 1;
+ 229   1        IT0  = 1;
+ 230   1        ES   = 1;
+ 231   1        IP   = 0x01;
+ 232   1        TR1  = 1;
+C51 COMPILER V9.60.0.0   MAIN                                                              03/31/2020 22:05:26 PAGE 5   
+
+ 233   1        
+ 234   1      //  SCON = 0x40;
+ 235   1      //  TMOD = 0x20;
+ 236   1      //  PCON = 0x00;
+ 237   1      //  TH1  = 0xfd;
+ 238   1      //  TL1  = 0xfd;
+ 239   1      //  TI   = 0;
+ 240   1      //  TR1  = 1;
+ 241   1        Delay(200);
+ 242   1        puts_to_SerialPort("Receiving From 8051...\r\n");
+ 243   1        puts_to_SerialPort("------------------------------\r\n");
+ 244   1        Delay(50);
+ 245   1        
+ 246   1        EA = 1;     //允许全局中断
+ 247   1        
+ 248   1        Init_MAX7219();  
+ 249   1      
+ 250   1        while (1)
+ 251   1        {
+ 252   2          
+ 253   2      //    if(TX1_Cnt != RX1_Cnt)    //收到过数据
+ 254   2      //    {
+ 255   2      //      if(!B_TX1_Busy)   //发送空闲
+ 256   2      //      {
+ 257   2      //        B_TX1_Busy = 1;   //标志发送忙
+ 258   2      //        SBUF = RX1_Buffer[TX1_Cnt]; //发一个字节
+ 259   2      //        if(++TX1_Cnt >= RX1_Lenth)  TX1_Cnt = 0;  //避免溢出处理
+ 260   2      //      }
+ 261   2      //    }
+ 262   2          
+ 263   2      //    for(i=0;i<100;i++)
+ 264   2      //    {
+ 265   2      //      if(Receive_Buffer[i]==-1) 
+ 266   2      //        break;
+ 267   2      //      puts_to_SerialPort("Received\r\n");
+ 268   2      //      //P0 = DSY_CODE[Receive_Buffer[i]];
+ 269   2      //      Delay(200); 
+ 270   2      //    }
+ 271   2          
+ 272   2          puts_to_SerialPort("Received\r\n");
+ 273   2          Delay(200);
+ 274   2          
+ 275   2      //    putc_to_SerialPort(c+'A');
+ 276   2      //    Delay(100);
+ 277   2      //    putc_to_SerialPort(' '); //这个地方‘’间只能有且必须有一个空格
+ 278   2      //    Delay(100);
+ 279   2      //    if(c==25)
+ 280   2      //    {
+ 281   2      //      puts_to_SerialPort("\r\n---------------------------\r\n");
+ 282   2      //      Delay(100);
+ 283   2      //    }
+ 284   2      //    c = (c+1)%26;
+ 285   2      //    if(c%10==0)
+ 286   2      //    {
+ 287   2      //      puts_to_SerialPort("\r\n");
+ 288   2      //      Delay(100);
+ 289   2      //    }
+ 290   2      //    
+ 291   2          
+ 292   2          
+ 293   2      //    //如果串口接收到的数据前5位是90311，则认为接收到的数据是对的
+ 294   2      //    if (RX1_Buffer[0] == 9 && RX1_Buffer[1] == 0 && RX1_Buffer[2] == 3 &&
+C51 COMPILER V9.60.0.0   MAIN                                                              03/31/2020 22:05:26 PAGE 6   
+
+ 295   2      //      RX1_Buffer[3] == 1 && RX1_Buffer[4] == 1)
+ 296   2      //    {
+ 297   2      //      //将数据累加起来
+ 298   2      //      Scan_BarCode += RX1_Buffer[0] * 10000000;
+ 299   2      //      Scan_BarCode += RX1_Buffer[1] * 1000000;
+ 300   2      //      Scan_BarCode += RX1_Buffer[2] * 100000;
+ 301   2      //      Scan_BarCode += RX1_Buffer[3] * 10000;
+ 302   2      //      Scan_BarCode += RX1_Buffer[4] * 1000;
+ 303   2      //      Scan_BarCode += RX1_Buffer[5] * 100;
+ 304   2      //      Scan_BarCode += RX1_Buffer[6] * 10;
+ 305   2      //      Scan_BarCode += RX1_Buffer[7] * 1;
+ 306   2      
+ 307   2      //      for (k = 0; k < 24; k++)
+ 308   2      //      {
+ 309   2      //        //判断哪一个值与定义好的数组相等，数组的序号就是这个柜子的序号
+ 310   2      //        if (BarCode_Table[k] == Scan_BarCode)
+ 311   2      //        {
+ 312   2      //          Matrix_LED[(k / 4 + 1) - 1][k - 1] = 1; //关闭LED灯
+ 313   2      //          Scan_BarCode = 0;           //扫描到的条码的值清零
+ 314   2      //        }
+ 315   2      //      }
+ 316   2      //    }
+ 317   2          
+ 318   2        }
+ 319   1      }
+ 320          
+ 321          void Serial_INT() interrupt 4
+ 322          {
+ 323   1        uchar c;
+ 324   1        if(RI==0) 
+ 325   1          return;
+ 326   1        ES = 0;
+ 327   1        RI = 0;
+ 328   1        c  = SBUF;
+ 329   1        if(c>='0' && c<='9')
+ 330   1        {
+ 331   2          Receive_Buffer[Buf_Index]=c-'0';
+ 332   2          Receive_Buffer[Buf_Index+1]=-1;
+ 333   2          Buf_Index = (Buf_Index+1)%100;  
+ 334   2        }
+ 335   1        ES = 1;
+ 336   1      }
+ 337          
+ 338          
+ 339          ///*********** UART1中断函数 使用了定时器2 **************/
+ 340          //void UART1_int(void) interrupt UART1_VECTOR
+ 341          //{
+ 342          //  if (RI) //接收中断标志位
+ 343          //  {
+ 344          //    RI = 0;           //清除接收中断标志位
+ 345          //    RX1_Buffer[RX1_Cnt] = SBUF; //保存一个字节
+ 346          //    if (++RX1_Cnt >= RX1_Lenth)
+ 347          //      RX1_Cnt = 0; //避免溢出处理
+ 348          //  }
+ 349          
+ 350          //  if (TI) //发送中断标志位
+ 351          //  {
+ 352          //    TI = 0;     //清除发送中断标志位
+ 353          //    B_TX1_Busy = 0; //清除发送忙标志
+ 354          //  }
+ 355          //}
+ 356          
+C51 COMPILER V9.60.0.0   MAIN                                                              03/31/2020 22:05:26 PAGE 7   
+
+ 357          #define timer0Period 50
+ 358          int timer0PeriodCount = 0;
+ 359          /*********** 定时器0中断函数 **************/
+ 360          void Timer0() interrupt 1
+ 361          {
+ 362   1        TH0 = (65536 - 500) / 256;
+ 363   1        TL0 = (65536 - 500) % 256;
+ 364   1        timer0PeriodCount++;
+ 365   1        if (timer0PeriodCount >= timer0Period)
+ 366   1        {
+ 367   2          timer0PeriodCount = 0;
+ 368   2          
+ 369   2          for(j=0;j<6;j++)    
+ 370   2          {            
+ 371   3            for(i=0;i<4;i++)
+ 372   3            {
+ 373   4              //(Matrix_KEY[j][i]==0)?(Matrix_LED[j][i]=1):(Matrix_LED[j][i]=0);
+ 374   4              (Matrix_KEY[j][i]==0)?(Matrix_LED[j][i]=1):(0);
+ 375   4              //if()
+ 376   4              led_line[j] |= (Matrix_LED[j][i] << (7-i));
+ 377   4            }
+ 378   3          }
+ 379   2      
+ 380   2          for(i=0;i<6;i++)
+ 381   2            Write_Max7219(i+1,led_line[i]);
+ 382   2          
+ 383   2          Write_Max7219(7,0x00);
+ 384   2          Write_Max7219(8,0x00);
+ 385   2          
+ 386   2          for(i=0;i<6;i++)
+ 387   2            led_line[i] = 0x00;
+ 388   2      
+ 389   2        }
+ 390   1      }
+ 391          
+ 392          /*********** 定时器1中断函数 **************/
+ 393          void Timer1() interrupt 3
+ 394          {
+ 395   1        TH1 = (65536 - 500) / 256;
+ 396   1        TL1 = (65536 - 500) % 256;
+ 397   1      
+ 398   1        KEY_LIST_INDEX++;      //选择列
+ 399   1        limit(KEY_LIST_INDEX, 1, 4); //限制变量在1-4范围内，超出4则变为1
+ 400   1      
+ 401   1        //将列每次置1一位，如此循环
+ 402   1        switch (KEY_LIST_INDEX)
+ 403   1        {
+ 404   2        case 1:
+ 405   2          PIN_KEY_LIST_1 = 0;
+ 406   2          PIN_KEY_LIST_2 = 1;
+ 407   2          PIN_KEY_LIST_3 = 1;
+ 408   2          PIN_KEY_LIST_4 = 1;
+ 409   2          break;
+ 410   2        case 2:
+ 411   2          PIN_KEY_LIST_1 = 1;
+ 412   2          PIN_KEY_LIST_2 = 0;
+ 413   2          PIN_KEY_LIST_3 = 1;
+ 414   2          PIN_KEY_LIST_4 = 1;
+ 415   2          break;
+ 416   2        case 3:
+ 417   2          PIN_KEY_LIST_1 = 1;
+ 418   2          PIN_KEY_LIST_2 = 1;
+C51 COMPILER V9.60.0.0   MAIN                                                              03/31/2020 22:05:26 PAGE 8   
+
+ 419   2          PIN_KEY_LIST_3 = 0;
+ 420   2          PIN_KEY_LIST_4 = 1;
+ 421   2          break;
+ 422   2        case 4:
+ 423   2          PIN_KEY_LIST_1 = 1;
+ 424   2          PIN_KEY_LIST_2 = 1;
+ 425   2          PIN_KEY_LIST_3 = 1;
+ 426   2          PIN_KEY_LIST_4 = 0;
+ 427   2          break;
+ 428   2        default:
+ 429   2          break;
+ 430   2        }
+ 431   1      
+ 432   1        //按键一列一列的扫描，读取每列端口的值储存在按键矩阵数组中
+ 433   1        Matrix_KEY[1 - 1][KEY_LIST_INDEX - 1] = PIN_KEY_LINE_1;
+ 434   1        Matrix_KEY[2 - 1][KEY_LIST_INDEX - 1] = PIN_KEY_LINE_2;
+ 435   1        Matrix_KEY[3 - 1][KEY_LIST_INDEX - 1] = PIN_KEY_LINE_3;
+ 436   1        Matrix_KEY[4 - 1][KEY_LIST_INDEX - 1] = PIN_KEY_LINE_4;
+ 437   1        Matrix_KEY[5 - 1][KEY_LIST_INDEX - 1] = PIN_KEY_LINE_5;
+ 438   1        Matrix_KEY[6 - 1][KEY_LIST_INDEX - 1] = PIN_KEY_LINE_6;
+ 439   1           
+ 440   1      }
+ 441          
+ 442          
+ 443          
+ 444          
+ 445          
+ 446          //LED点阵列接口定义
+ 447          //sbit PIN_LED_LIST_1 = P3 ^ 4;
+ 448          //sbit PIN_LED_LIST_2 = P3 ^ 5;
+ 449          //sbit PIN_LED_LIST_3 = P3 ^ 6;
+ 450          //sbit PIN_LED_LIST_4 = P3 ^ 7;
+ 451          ////LED点阵行接口定义
+ 452          //sbit PIN_LED_LINE_1 = P0 ^ 0;
+ 453          //sbit PIN_LED_LINE_2 = P0 ^ 1;
+ 454          //sbit PIN_LED_LINE_3 = P0 ^ 2;
+ 455          //sbit PIN_LED_LINE_4 = P0 ^ 3;
+ 456          //sbit PIN_LED_LINE_5 = P0 ^ 4;
+ 457          //sbit PIN_LED_LINE_6 = P0 ^ 5;
+ 458          
+ 459              
+ 460          //    LED_LIST_INDEX++;      //选择列
+ 461          //    limit(LED_LIST_INDEX, 1, 4); //限制变量在1-4范围内，超出4则变为1
+ 462          
+ 463          //    //将列每次置1一位，如此循环
+ 464          //    switch (LED_LIST_INDEX)
+ 465          //    {
+ 466          //    case 1:
+ 467          //      PIN_LED_LIST_1 = 1;
+ 468          //      PIN_LED_LIST_2 = 0;
+ 469          //      PIN_LED_LIST_3 = 0;
+ 470          //      PIN_LED_LIST_4 = 0;
+ 471          //      break;
+ 472          //    case 2:
+ 473          //      PIN_LED_LIST_1 = 0;
+ 474          //      PIN_LED_LIST_2 = 1;
+ 475          //      PIN_LED_LIST_3 = 0;
+ 476          //      PIN_LED_LIST_4 = 0;
+ 477          //      break;
+ 478          //    case 3:
+ 479          //      PIN_LED_LIST_1 = 0;
+ 480          //      PIN_LED_LIST_2 = 0;
+C51 COMPILER V9.60.0.0   MAIN                                                              03/31/2020 22:05:26 PAGE 9   
+
+ 481          //      PIN_LED_LIST_3 = 1;
+ 482          //      PIN_LED_LIST_4 = 0;
+ 483          //      break;
+ 484          //    case 4:
+ 485          //      PIN_LED_LIST_1 = 0;
+ 486          //      PIN_LED_LIST_2 = 0;
+ 487          //      PIN_LED_LIST_3 = 0;
+ 488          //      PIN_LED_LIST_4 = 1;
+ 489          //      break;
+ 490          //    default:
+ 491          //      break;
+ 492          //    }
+ 493          
+ 494          //    //将LED矩阵数组里的一列中每行的值付给引脚
+ 495          //    PIN_LED_LINE_1 = Matrix_LED[1 - 1][LED_LIST_INDEX - 1];
+ 496          //    PIN_LED_LINE_2 = Matrix_LED[2 - 1][LED_LIST_INDEX - 1];
+ 497          //    PIN_LED_LINE_3 = Matrix_LED[3 - 1][LED_LIST_INDEX - 1];
+ 498          //    PIN_LED_LINE_4 = Matrix_LED[4 - 1][LED_LIST_INDEX - 1];
+ 499          //    PIN_LED_LINE_5 = Matrix_LED[5 - 1][LED_LIST_INDEX - 1];
+ 500          //    PIN_LED_LINE_6 = Matrix_LED[6 - 1][LED_LIST_INDEX - 1];
+ 501          
+ 502          //    //实时监测按键的状态，按键按下对应的LED灯亮
+ 503          //    for (i = 0; i < 6; i++)
+ 504          //    {
+ 505          //      for (j = 0; j < 4; j++)
+ 506          //      {
+ 507          //        if (Matrix_KEY[i][j] == 0)
+ 508          //        {
+ 509          //          Matrix_LED[i][j] = 0;
+ 510          //        }
+ 511          //      }
+ 512          //    }
+ 513          
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =   1123    ----
+   CONSTANT SIZE    =     69    ----
+   XDATA SIZE       =    271       3
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =   ----    ----
+   IDATA SIZE       =     32    ----
+   BIT SIZE         =      1    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  7 WARNING(S),  0 ERROR(S)
